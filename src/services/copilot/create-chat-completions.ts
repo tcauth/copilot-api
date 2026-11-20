@@ -7,6 +7,7 @@ import { state } from "~/lib/state"
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
+  signal?: AbortSignal,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -32,6 +33,7 @@ export const createChatCompletions = async (
     method: "POST",
     headers,
     body: JSON.stringify(payload),
+    signal,
   })
 
   if (!response.ok) {
@@ -65,6 +67,7 @@ export interface ChatCompletionChunk {
     completion_tokens_details?: {
       accepted_prediction_tokens: number
       rejected_prediction_tokens: number
+      reasoning_tokens?: number
     }
   }
 }
@@ -106,6 +109,9 @@ export interface ChatCompletionResponse {
     prompt_tokens_details?: {
       cached_tokens: number
     }
+    completion_tokens_details?: {
+      reasoning_tokens?: number
+    }
   }
 }
 
@@ -138,7 +144,21 @@ export interface ChatCompletionsPayload {
   presence_penalty?: number | null
   logit_bias?: Record<string, number> | null
   logprobs?: boolean | null
-  response_format?: { type: "json_object" } | null
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+  verbosity?: "low" | "medium" | "high"
+  parallel_tool_calls?: boolean
+  response_format?:
+    | { type: "json_object" }
+    | {
+        type: "json_schema"
+        json_schema: {
+          name: string
+          description?: string
+          schema: Record<string, unknown>
+          strict?: boolean
+        }
+      }
+    | null
   seed?: number | null
   tools?: Array<Tool> | null
   tool_choice?:
