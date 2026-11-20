@@ -349,6 +349,19 @@ function translateTools(
   }))
 }
 
+function optionalToolSettings(
+  payload: ResponsesPayload,
+  tools: Array<Tool> | undefined,
+): Pick<ChatCompletionsPayload, "tool_choice" | "parallel_tool_calls"> {
+  if (!tools && payload.tool_choice === "required") {
+    unsupported("tool_choice=required requires at least one function tool")
+  }
+  return {
+    tool_choice: tools ? payload.tool_choice : undefined,
+    parallel_tool_calls: tools ? payload.parallel_tool_calls : undefined,
+  }
+}
+
 export function createResponsesTranslation(
   payload: ResponsesPayload,
 ): ResponsesTranslation {
@@ -378,14 +391,14 @@ export function createResponsesTranslation(
 
   const definitions = collectTools(payload)
   const toolNames = createToolNames(definitions)
+  const tools = translateTools(definitions, toolNames)
   return {
     chatPayload: {
       model: payload.model,
       messages: translateInput(payload.input, toolNames),
       stream: payload.stream ?? false,
-      tools: translateTools(definitions, toolNames),
-      tool_choice: payload.tool_choice,
-      parallel_tool_calls: payload.parallel_tool_calls,
+      tools,
+      ...optionalToolSettings(payload, tools),
       reasoning_effort: payload.reasoning?.effort,
       verbosity: payload.text?.verbosity,
       response_format: responseFormat,

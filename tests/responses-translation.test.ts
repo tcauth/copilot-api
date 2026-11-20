@@ -240,6 +240,27 @@ describe("Codex Responses base request translation", () => {
     })
   })
 
+  test("omits optional tool settings without declarations", () => {
+    const translated = translateResponsesRequest({
+      model: "gpt-test",
+      input: "No tools",
+      tool_choice: "auto",
+      parallel_tool_calls: true,
+    })
+    const serialized = JSON.stringify(translated)
+    expect(serialized).not.toContain('"tool_choice"')
+    expect(serialized).not.toContain('"parallel_tool_calls"')
+    expect(serialized).not.toContain('"tools"')
+
+    expect(() =>
+      translateResponsesRequest({
+        model: "gpt-test",
+        input: "A tool is required",
+        tool_choice: "required",
+      }),
+    ).toThrow("tool_choice=required requires at least one function tool")
+  })
+
   test("rejects provider-hosted tools and stored responses", () => {
     expect(() =>
       translateResponsesRequest({
