@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
 
+import type { ResponsesPayload } from "~/routes/responses/types"
 import type { ChatCompletionChunk } from "~/services/copilot/create-chat-completions"
 
 import {
   completeStream,
+  createResponsesTranslation,
   createStreamState,
   translateResponsesRequest,
   translateResponsesResult,
@@ -12,6 +14,136 @@ import {
 } from "../src/routes/responses/translation"
 
 describe("Codex Responses request translation", () => {
+  test("translates captured top-level flat and namespace tools", async () => {
+    const payload = await fixture("codex-namespace-tools.json")
+    const { chatPayload, toolNames } = createResponsesTranslation(payload)
+
+    expect(chatPayload.tools).toHaveLength(2)
+    expect(chatPayload.tools?.[0]).toMatchObject({
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read one file",
+      },
+    })
+    expect(chatPayload.tools?.[0]?.function.parameters).toEqual({
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    })
+    expect(chatPayload.tools?.[1]).toMatchObject({
+      type: "function",
+      function: {
+        name: "multi_agent_v1__spawn_agent",
+        description: "Coordinate local agents\n\nStart one agent",
+      },
+    })
+    expect(toolNames.fromCopilot.get("multi_agent_v1__spawn_agent")).toEqual({
+      name: "spawn_agent",
+      namespace: "multi_agent_v1",
+    })
+  })
+
+  test("translates captured additional_tools without adding a message", async () => {
+    const payload = await fixture("codex-additional-tools.json")
+    const { chatPayload, toolNames } = createResponsesTranslation(payload)
+
+    expect(chatPayload.messages).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "Inspect the workspace." }],
+      },
+    ])
+    expect(chatPayload.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "functions__exec_command",
+          description: "Local Codex tools\n\nRun a local command",
+          parameters: {
+            type: "object",
+            properties: { cmd: { type: "string" } },
+            required: ["cmd"],
+            additionalProperties: false,
+          },
+        },
+      },
+    ])
+    expect(
+      toolNames.toCopilot.get(JSON.stringify(["functions", "exec_command"])),
+    ).toBe("functions__exec_command")
+  })
+
+  test("maps historical namespaced calls and correlated results", () => {
+    const { chatPayload } = createResponsesTranslation({
+      model: "gpt-test",
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          namespace: "functions",
+          name: "exec_command",
+          arguments: '{"cmd":"pwd"}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_1",
+          output: String.raw`C:\work`,
+        },
+      ],
+      tools: [namespaceTool("functions", "exec_command")],
+    })
+
+    expect(chatPayload.messages).toEqual([
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: {
+              name: "functions__exec_command",
+              arguments: '{"cmd":"pwd"}',
+            },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: String.raw`C:\work` },
+    ])
+  })
+
+  test("uses deterministic collision-safe names", () => {
+    const payload: ResponsesPayload = {
+      model: "gpt-test",
+      input: "test",
+      tools: [
+        functionTool("a__b"),
+        namespaceTool("a", "b"),
+        namespaceTool("a.", "b"),
+        namespaceTool("a_", "b"),
+      ],
+    }
+    const first = createResponsesTranslation(payload)
+    const second = createResponsesTranslation(payload)
+    const firstNames = first.chatPayload.tools?.map(
+      (tool) => tool.function.name,
+    )
+    const secondNames = second.chatPayload.tools?.map(
+      (tool) => tool.function.name,
+    )
+
+    expect(firstNames).toEqual(secondNames)
+    expect(new Set(firstNames).size).toBe(4)
+    expect(firstNames?.[0]).toBe("a__b")
+    expect(firstNames?.slice(1).every((name) => /^ns_[\w-]+$/.test(name))).toBe(
+      true,
+    )
+    expect(firstNames?.every((name) => name.length <= 64)).toBe(true)
+  })
+})
+
+describe("Codex Responses base request translation", () => {
   test("translates messages, tools, and function results", () => {
     const translated = translateResponsesRequest({
       model: "gpt-5.1-codex",
@@ -124,6 +256,46 @@ describe("Codex Responses request translation", () => {
         store: true,
       }),
     ).toThrow("store=true is not supported")
+  })
+
+  test("rejects malformed nested tools and unknown historical calls", () => {
+    expect(() =>
+      createResponsesTranslation({
+        model: "gpt-test",
+        input: "test",
+        tools: [
+          {
+            type: "namespace",
+            name: "functions",
+            tools: [{ type: "function", name: "broken" }],
+          },
+        ],
+      }),
+    ).toThrow("function tools require name and parameters")
+
+    expect(() =>
+      createResponsesTranslation({
+        model: "gpt-test",
+        input: [
+          {
+            type: "function_call",
+            call_id: "call_1",
+            namespace: "missing",
+            name: "tool",
+            arguments: "{}",
+          },
+        ],
+      }),
+    ).toThrow("references unknown namespace tool")
+
+    const valid = createResponsesTranslation({
+      model: "gpt-test",
+      input: "still isolated",
+      tools: [namespaceTool("functions", "exec_command")],
+    })
+    expect(valid.chatPayload.tools?.[0]?.function.name).toBe(
+      "functions__exec_command",
+    )
   })
 })
 
@@ -240,6 +412,127 @@ describe("Codex Responses result translation", () => {
     expect(completed.response.usage.total_tokens).toBe(16)
   })
 })
+
+describe("Codex Responses namespace result translation", () => {
+  test("restores namespace for non-streaming and fragmented streaming calls", () => {
+    const translation = createResponsesTranslation({
+      model: "gpt-test",
+      input: "use a tool",
+      tools: [namespaceTool("functions", "exec_command")],
+    })
+    const flattened = translation.chatPayload.tools?.[0]?.function.name ?? ""
+    const response = {
+      id: "chatcmpl_ns",
+      object: "chat.completion" as const,
+      created: 123,
+      model: "gpt-test",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant" as const,
+            content: null,
+            tool_calls: [
+              {
+                id: "call_ns",
+                type: "function" as const,
+                function: { name: flattened, arguments: '{"cmd":"pwd"}' },
+              },
+            ],
+          },
+          logprobs: null,
+          finish_reason: "tool_calls" as const,
+        },
+      ],
+    }
+    expect(
+      translateResponsesResult(
+        response,
+        { model: "gpt-test", input: "use a tool" },
+        translation.toolNames,
+      ).output[0],
+    ).toMatchObject({
+      type: "function_call",
+      name: "exec_command",
+      namespace: "functions",
+    })
+
+    const state = createStreamState("gpt-test", translation.toolNames)
+    const split = Math.floor(flattened.length / 2)
+    const events = [
+      ...translateStreamChunk(
+        chunk({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_ns",
+              function: {
+                name: flattened.slice(0, split),
+                arguments: '{"cmd":',
+              },
+            },
+          ],
+        }),
+        state,
+      ),
+      ...translateStreamChunk(
+        chunk({
+          tool_calls: [
+            {
+              index: 0,
+              function: {
+                name: flattened.slice(split),
+                arguments: '"pwd"}',
+              },
+            },
+          ],
+        }),
+        state,
+      ),
+      ...completeStream(state),
+    ]
+    const added = events.find(
+      (event) => event.type === "response.output_item.added",
+    )
+    expect(added?.item).toMatchObject({
+      name: "exec_command",
+      namespace: "functions",
+    })
+    expect(
+      events
+        .filter(
+          (event) => event.type === "response.function_call_arguments.delta",
+        )
+        .map((event) => event.delta)
+        .join(""),
+    ).toBe('{"cmd":"pwd"}')
+  })
+})
+
+async function fixture(name: string): Promise<ResponsesPayload> {
+  const payload: unknown = await Bun.file(
+    new URL(`fixtures/${name}`, import.meta.url),
+  ).json()
+  return payload as ResponsesPayload
+}
+
+function functionTool(name: string) {
+  return {
+    type: "function" as const,
+    name,
+    description: `Use ${name}`,
+    parameters: { type: "object", properties: {} },
+  }
+}
+
+function namespaceTool(namespace: string, name: string) {
+  return {
+    type: "namespace" as const,
+    name: namespace,
+    description: `Use ${namespace}`,
+    tools: [functionTool(name)],
+  }
+}
 
 function chunk(
   delta: ChatCompletionChunk["choices"][number]["delta"],

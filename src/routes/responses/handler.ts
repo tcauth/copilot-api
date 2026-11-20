@@ -15,8 +15,8 @@ import type { ResponsesPayload } from "./types"
 
 import {
   completeStream,
+  createResponsesTranslation,
   createStreamState,
-  translateResponsesRequest,
   translateResponsesResult,
   translateStreamChunk,
 } from "./translation"
@@ -53,16 +53,16 @@ export async function handleResponse(c: Context) {
     )
   }
 
-  const chatPayload = translateResponsesRequest(payload)
+  const { chatPayload, toolNames } = createResponsesTranslation(payload)
   if (state.manualApprove) await awaitApproval()
   const response = await createChatCompletions(chatPayload, c.req.raw.signal)
 
   if (isNonStreaming(response)) {
-    return c.json(translateResponsesResult(response, payload))
+    return c.json(translateResponsesResult(response, payload, toolNames))
   }
 
   return streamSSE(c, async (stream) => {
-    const streamState = createStreamState(payload.model)
+    const streamState = createStreamState(payload.model, toolNames)
     try {
       for await (const rawEvent of response) {
         if (rawEvent.data === "[DONE]") break

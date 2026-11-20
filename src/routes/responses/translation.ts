@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import type {
   ChatCompletionsPayload,
@@ -11,7 +11,11 @@ import type {
   ChatCompletionChunk,
   ChatCompletionResponse,
   ResponseContent,
+  ResponseFunctionTool,
+  ResponseInputItem,
+  ResponseNamespaceTool,
   ResponseOutputItem,
+  ResponseTool,
   ResponsesPayload,
   ResponsesResult,
   ResponsesStreamState,
@@ -20,6 +24,16 @@ import type {
 
 export class UnsupportedResponsesFeatureError extends Error {
   code = "unsupported_responses_feature"
+}
+
+export interface ResponsesToolNames {
+  fromCopilot: Map<string, { name: string; namespace?: string }>
+  toCopilot: Map<string, string>
+}
+
+export interface ResponsesTranslation {
+  chatPayload: ChatCompletionsPayload
+  toolNames: ResponsesToolNames
 }
 
 function unsupported(message: string): never {
@@ -77,51 +91,35 @@ function outputToText(output: string | Array<ResponseContent>): string {
   return text.join("\n")
 }
 
-function translateInput(input: ResponsesPayload["input"]): Array<Message> {
+function toolKey(name: string, namespace?: string): string {
+  return JSON.stringify([namespace ?? null, name])
+}
+
+function translateInput(
+  input: ResponsesPayload["input"],
+  toolNames: ResponsesToolNames,
+): Array<Message> {
   if (typeof input === "string") return [{ role: "user", content: input }]
 
   const messages: Array<Message> = []
   for (const item of input) {
     switch (item.type) {
       case "message": {
-        if (!item.role || item.content === undefined) {
-          unsupported("message.role and message.content are required")
+        messages.push(translateMessage(item))
+        break
+      }
+      case "additional_tools": {
+        if (item.role !== "developer" || !Array.isArray(item.tools)) {
+          unsupported("additional_tools requires developer role and tools")
         }
-        messages.push({
-          role: item.role,
-          content: contentToChat(item.content),
-        })
-
         break
       }
       case "function_call": {
-        if (!item.call_id || !item.name || item.arguments === undefined) {
-          unsupported("function_call.call_id, name, and arguments are required")
-        }
-        messages.push({
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: item.call_id,
-              type: "function",
-              function: { name: item.name, arguments: item.arguments },
-            },
-          ],
-        })
-
+        messages.push(translateFunctionCall(item, toolNames))
         break
       }
       case "function_call_output": {
-        if (!item.call_id || item.output === undefined) {
-          unsupported("function_call_output.call_id and output are required")
-        }
-        messages.push({
-          role: "tool",
-          tool_call_id: item.call_id,
-          content: outputToText(item.output),
-        })
-
+        messages.push(translateFunctionOutput(item))
         break
       }
       default: {
@@ -132,30 +130,228 @@ function translateInput(input: ResponsesPayload["input"]): Array<Message> {
   return messages
 }
 
-function translateTools(
-  tools: ResponsesPayload["tools"],
-): Array<Tool> | undefined {
-  return tools?.map((tool) => {
-    if (tool.type !== "function") {
-      unsupported(`tool type '${tool.type}' is not supported`)
-    }
-    if (!tool.name || !tool.parameters) {
-      unsupported("function tools require name and parameters")
-    }
-    return {
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parameters,
-      },
-    }
-  })
+function translateMessage(item: ResponseInputItem): Message {
+  if (!item.role || item.content === undefined) {
+    unsupported("message.role and message.content are required")
+  }
+  return {
+    role: item.role,
+    content: contentToChat(item.content),
+  }
 }
 
-export function translateResponsesRequest(
+function translateFunctionCall(
+  item: ResponseInputItem,
+  toolNames: ResponsesToolNames,
+): Message {
+  if (!item.call_id || !item.name || item.arguments === undefined) {
+    unsupported("function_call.call_id, name, and arguments are required")
+  }
+  const mappedName =
+    toolNames.toCopilot.get(toolKey(item.name, item.namespace))
+    ?? (item.namespace ? undefined : item.name)
+  if (!mappedName) {
+    unsupported(
+      `function_call references unknown namespace tool '${item.namespace}.${item.name}'`,
+    )
+  }
+  return {
+    role: "assistant",
+    content: null,
+    tool_calls: [
+      {
+        id: item.call_id,
+        type: "function",
+        function: { name: mappedName, arguments: item.arguments },
+      },
+    ],
+  }
+}
+
+function translateFunctionOutput(item: ResponseInputItem): Message {
+  if (!item.call_id || item.output === undefined) {
+    unsupported("function_call_output.call_id and output are required")
+  }
+  return {
+    role: "tool",
+    tool_call_id: item.call_id,
+    content: outputToText(item.output),
+  }
+}
+
+interface ToolDefinition {
+  name: string
+  namespace?: string
+  namespaceDescription?: string
+  description?: string
+  parameters: Record<string, unknown>
+}
+
+function collectTools(payload: ResponsesPayload): Array<ToolDefinition> {
+  const declared: Array<ResponseTool> = [...(payload.tools ?? [])]
+  if (Array.isArray(payload.input)) {
+    for (const item of payload.input) {
+      if (item.type !== "additional_tools") continue
+      if (item.role !== "developer" || !Array.isArray(item.tools)) {
+        unsupported("additional_tools requires developer role and tools")
+      }
+      declared.push(...item.tools)
+    }
+  }
+
+  const definitions = new Map<string, ToolDefinition>()
+  const add = (definition: ToolDefinition) => {
+    const key = toolKey(definition.name, definition.namespace)
+    const existing = definitions.get(key)
+    if (existing && JSON.stringify(existing) !== JSON.stringify(definition)) {
+      unsupported(
+        `conflicting tool declaration for '${definition.namespace ? `${definition.namespace}.` : ""}${definition.name}'`,
+      )
+    }
+    definitions.set(key, existing ?? definition)
+  }
+
+  for (const tool of declared) {
+    if (isFunctionTool(tool)) {
+      add(functionDefinition(tool))
+      continue
+    }
+    if (!isNamespaceTool(tool)) {
+      unsupported(`tool type '${tool.type}' is not supported`)
+    }
+    if (!tool.name || !Array.isArray(tool.tools)) {
+      unsupported("namespace tools require name and tools")
+    }
+    for (const nested of tool.tools) {
+      if (nested.type !== "function") {
+        unsupported(
+          `namespace '${tool.name}' tool type '${nested.type}' is not supported`,
+        )
+      }
+      add({
+        ...functionDefinition(nested),
+        namespace: tool.name,
+        namespaceDescription: tool.description,
+      })
+    }
+  }
+  return [...definitions.values()]
+}
+
+function functionDefinition(tool: ResponseFunctionTool): ToolDefinition {
+  if (
+    typeof tool.name !== "string"
+    || tool.name.length === 0
+    || !isRecord(tool.parameters)
+  ) {
+    unsupported("function tools require name and parameters")
+  }
+  return {
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isFunctionTool(tool: ResponseTool): tool is ResponseFunctionTool {
+  return tool.type === "function"
+}
+
+function isNamespaceTool(tool: ResponseTool): tool is ResponseNamespaceTool {
+  return tool.type === "namespace"
+}
+
+function createToolNames(
+  definitions: Array<ToolDefinition>,
+): ResponsesToolNames {
+  const fromCopilot = new Map<string, { name: string; namespace?: string }>()
+  const toCopilot = new Map<string, string>()
+  const reserved = new Set(
+    definitions.filter((tool) => !tool.namespace).map((tool) => tool.name),
+  )
+  if (reserved.size !== definitions.filter((tool) => !tool.namespace).length) {
+    unsupported("duplicate flat function tool name")
+  }
+
+  for (const definition of definitions.filter((tool) => !tool.namespace)) {
+    fromCopilot.set(definition.name, { name: definition.name })
+    toCopilot.set(toolKey(definition.name), definition.name)
+  }
+
+  const namespaced = definitions
+    .filter((tool) => tool.namespace)
+    .sort((left, right) =>
+      toolKey(left.name, left.namespace).localeCompare(
+        toolKey(right.name, right.namespace),
+      ),
+    )
+  const preferredCounts = new Map<string, number>()
+  for (const definition of namespaced) {
+    const preferred = preferredToolName(definition)
+    preferredCounts.set(preferred, (preferredCounts.get(preferred) ?? 0) + 1)
+  }
+
+  for (const definition of namespaced) {
+    const preferred = preferredToolName(definition)
+    let flattened =
+      preferredCounts.get(preferred) === 1 && !reserved.has(preferred) ?
+        preferred
+      : hashedToolName(definition, 0)
+    for (let attempt = 1; reserved.has(flattened); attempt++) {
+      flattened = hashedToolName(definition, attempt)
+    }
+    reserved.add(flattened)
+    fromCopilot.set(flattened, {
+      name: definition.name,
+      namespace: definition.namespace,
+    })
+    toCopilot.set(toolKey(definition.name, definition.namespace), flattened)
+  }
+  return { fromCopilot, toCopilot }
+}
+
+function preferredToolName(definition: ToolDefinition): string {
+  const name = `${definition.namespace}__${definition.name}`.replaceAll(
+    /[^\w-]/g,
+    "_",
+  )
+  return name.slice(0, 64)
+}
+
+function hashedToolName(definition: ToolDefinition, attempt: number): string {
+  const digest = createHash("sha256")
+    .update(`${attempt}\0${definition.namespace}\0${definition.name}`)
+    .digest("base64url")
+  return `ns_${digest}`
+}
+
+function translateTools(
+  definitions: Array<ToolDefinition>,
+  toolNames: ResponsesToolNames,
+): Array<Tool> | undefined {
+  if (definitions.length === 0) return undefined
+  return definitions.map((tool) => ({
+    type: "function",
+    function: {
+      name:
+        toolNames.toCopilot.get(toolKey(tool.name, tool.namespace))
+        ?? tool.name,
+      description:
+        tool.namespaceDescription ?
+          `${tool.namespaceDescription}\n\n${tool.description ?? ""}`.trim()
+        : tool.description,
+      parameters: tool.parameters,
+    },
+  }))
+}
+
+export function createResponsesTranslation(
   payload: ResponsesPayload,
-): ChatCompletionsPayload {
+): ResponsesTranslation {
   if (!payload.model) unsupported("model is required")
   if (payload.store === true) unsupported("store=true is not supported")
   if (payload.previous_response_id) {
@@ -180,17 +376,28 @@ export function translateResponsesRequest(
     }
   }
 
+  const definitions = collectTools(payload)
+  const toolNames = createToolNames(definitions)
   return {
-    model: payload.model,
-    messages: translateInput(payload.input),
-    stream: payload.stream ?? false,
-    tools: translateTools(payload.tools),
-    tool_choice: payload.tool_choice,
-    parallel_tool_calls: payload.parallel_tool_calls,
-    reasoning_effort: payload.reasoning?.effort,
-    verbosity: payload.text?.verbosity,
-    response_format: responseFormat,
+    chatPayload: {
+      model: payload.model,
+      messages: translateInput(payload.input, toolNames),
+      stream: payload.stream ?? false,
+      tools: translateTools(definitions, toolNames),
+      tool_choice: payload.tool_choice,
+      parallel_tool_calls: payload.parallel_tool_calls,
+      reasoning_effort: payload.reasoning?.effort,
+      verbosity: payload.text?.verbosity,
+      response_format: responseFormat,
+    },
+    toolNames,
   }
+}
+
+export function translateResponsesRequest(
+  payload: ResponsesPayload,
+): ChatCompletionsPayload {
+  return createResponsesTranslation(payload).chatPayload
 }
 
 function usageFromChat(
@@ -214,6 +421,7 @@ function usageFromChat(
 export function translateResponsesResult(
   response: ChatCompletionResponse,
   request: ResponsesPayload,
+  toolNames?: ResponsesToolNames,
 ): ResponsesResult {
   const output: Array<ResponseOutputItem> = []
   for (const [choiceIndex, choice] of response.choices.entries()) {
@@ -235,12 +443,14 @@ export function translateResponsesResult(
     for (const [toolIndex, tool] of (
       choice.message.tool_calls ?? []
     ).entries()) {
+      const original = toolNames?.fromCopilot.get(tool.function.name)
       output.push({
         type: "function_call",
         id: `fc_${response.id}_${choiceIndex}_${toolIndex}`,
         status: "completed",
         call_id: tool.id,
-        name: tool.function.name,
+        name: original?.name ?? tool.function.name,
+        namespace: original?.namespace,
         arguments: tool.function.arguments,
       })
     }
@@ -263,13 +473,17 @@ export function translateResponsesResult(
   }
 }
 
-export function createStreamState(model: string): ResponsesStreamState {
+export function createStreamState(
+  model: string,
+  toolNames?: ResponsesToolNames,
+): ResponsesStreamState {
   return {
     model,
     created: false,
     text: "",
     textItemAdded: false,
     tools: new Map(),
+    toolNames,
   }
 }
 
@@ -338,45 +552,87 @@ function appendToolDeltas(
   output: Array<Record<string, unknown>>,
 ) {
   for (const delta of deltas ?? []) {
-    let tool = state.tools.get(delta.index)
-    if (!tool) {
-      tool = {
-        id: `fc_${state.responseId}_${delta.index}`,
-        callId: delta.id ?? `call_${randomUUID()}`,
-        name: "",
-        arguments: "",
-        added: false,
-      }
-      state.tools.set(delta.index, tool)
-    }
+    const tool = getStreamTool(delta, state)
     if (delta.id) tool.callId = delta.id
     if (delta.function?.name) tool.name += delta.function.name
-    const outputIndex = state.textItemAdded ? delta.index + 1 : delta.index
-    if (!tool.added && tool.name) {
-      tool.added = true
-      output.push({
-        type: "response.output_item.added",
-        output_index: outputIndex,
-        item: {
-          type: "function_call",
-          id: tool.id,
-          status: "in_progress",
-          call_id: tool.callId,
-          name: tool.name,
-          arguments: "",
-        },
-      })
-    }
     if (delta.function?.arguments) {
       tool.arguments += delta.function.arguments
-      output.push({
-        type: "response.function_call_arguments.delta",
-        item_id: tool.id,
-        output_index: outputIndex,
-        delta: delta.function.arguments,
-      })
     }
+    const outputIndex = state.textItemAdded ? delta.index + 1 : delta.index
+    addStreamTool(tool, outputIndex, { state, output })
+    appendStreamToolArguments(tool, outputIndex, output)
   }
+}
+
+type StreamTool =
+  ResponsesStreamState["tools"] extends Map<number, infer Tool> ? Tool : never
+type ToolDelta = NonNullable<
+  ChatCompletionChunk["choices"][number]["delta"]["tool_calls"]
+>[number]
+interface StreamToolOutputContext {
+  state: ResponsesStreamState
+  output: Array<Record<string, unknown>>
+}
+
+function getStreamTool(
+  delta: ToolDelta,
+  state: ResponsesStreamState,
+): StreamTool {
+  const existing = state.tools.get(delta.index)
+  if (existing) return existing
+  const tool: StreamTool = {
+    id: `fc_${state.responseId}_${delta.index}`,
+    callId: delta.id ?? `call_${randomUUID()}`,
+    name: "",
+    arguments: "",
+    emittedArgumentLength: 0,
+    added: false,
+  }
+  state.tools.set(delta.index, tool)
+  return tool
+}
+
+function addStreamTool(
+  tool: StreamTool,
+  outputIndex: number,
+  context: StreamToolOutputContext,
+) {
+  const original = context.state.toolNames?.fromCopilot.get(tool.name)
+  if (tool.added || !tool.name || (!original && context.state.toolNames)) {
+    return
+  }
+  tool.added = true
+  tool.responseName = original?.name ?? tool.name
+  tool.namespace = original?.namespace
+  context.output.push({
+    type: "response.output_item.added",
+    output_index: outputIndex,
+    item: {
+      type: "function_call",
+      id: tool.id,
+      status: "in_progress",
+      call_id: tool.callId,
+      name: tool.responseName,
+      namespace: tool.namespace,
+      arguments: "",
+    },
+  })
+}
+
+function appendStreamToolArguments(
+  tool: StreamTool,
+  outputIndex: number,
+  output: Array<Record<string, unknown>>,
+) {
+  if (!tool.added || tool.arguments.length <= tool.emittedArgumentLength) return
+  const argumentDelta = tool.arguments.slice(tool.emittedArgumentLength)
+  tool.emittedArgumentLength = tool.arguments.length
+  output.push({
+    type: "response.function_call_arguments.delta",
+    item_id: tool.id,
+    output_index: outputIndex,
+    delta: argumentDelta,
+  })
 }
 
 export function completeStream(
@@ -399,12 +655,17 @@ export function completeStream(
   }
 
   for (const [index, tool] of state.tools) {
+    const original = state.toolNames?.fromCopilot.get(tool.name)
+    if (state.toolNames && !original) {
+      unsupported(`Copilot returned unknown tool '${tool.name}'`)
+    }
     const item: ResponseOutputItem = {
       type: "function_call",
       id: tool.id,
       status: "completed",
       call_id: tool.callId,
-      name: tool.name,
+      name: tool.responseName ?? original?.name ?? tool.name,
+      namespace: tool.namespace ?? original?.namespace,
       arguments: tool.arguments,
     }
     finalItems.push(item)

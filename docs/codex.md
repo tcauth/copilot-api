@@ -19,10 +19,13 @@ The compatibility target was recorded on 2026-11-19:
 ## Codex CLI configuration
 
 Start `copilot-api`, then choose a model returned by its `GET /v1/models`
-endpoint. Add the following to `~/.codex/config.toml`:
+endpoint that Copilot also allows through Chat Completions. The Responses
+adapter currently uses that upstream surface; some catalog-visible,
+Responses-only models are rejected by Copilot. Add the following to
+`~/.codex/config.toml`:
 
 ```toml
-model = "gpt-5.3-codex"
+model = "gpt-4.1"
 model_provider = "github-copilot-proxy"
 
 [model_providers.github-copilot-proxy]
@@ -35,8 +38,10 @@ request_max_retries = 1
 stream_max_retries = 1
 ```
 
-Replace `gpt-5.3-codex` if it is not in `GET /v1/models`. Model names are
-validated against the current Copilot catalog.
+Replace `gpt-4.1` with another model verified on both `GET /v1/models` and an
+actual request. On 2026-11-20, `gpt-4.1` was the current verified equivalent;
+`gpt-5.3-codex` was catalog-visible but Copilot rejected it on Chat
+Completions. Model names are still validated against the current catalog.
 
 `requires_openai_auth = false` means Codex sends no OpenAI credential to the
 local proxy. `copilot-api` continues to obtain and refresh its GitHub Copilot
@@ -52,7 +57,7 @@ import { Codex } from "@openai/codex-sdk"
 
 const codex = new Codex({
   config: {
-    model: "gpt-5.3-codex",
+    model: "gpt-4.1",
     model_provider: "github-copilot-proxy",
   },
   configOverrides: [
@@ -72,6 +77,14 @@ assistant messages, URL/data-URL images, function declarations, function
 calls and results, parallel function calls, structured JSON-schema output,
 reasoning effort, verbosity, streaming text/tool-call events, request
 cancellation, response IDs, and token usage.
+
+Codex `additional_tools` input items and namespace tool declarations are
+accepted. Namespace functions are flattened to deterministic,
+collision-safe Copilot function names for each request, then restored to their
+original `name` and `namespace` in function-call events. Descriptions and JSON
+schemas are preserved. Existing flat function names remain unchanged.
+Malformed namespaces, undeclared namespaced calls, and nested non-function
+tools are rejected rather than dropped.
 
 The following Responses features cannot be represented faithfully by
 Copilot's Chat Completions surface:

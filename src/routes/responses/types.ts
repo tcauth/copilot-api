@@ -7,8 +7,10 @@ export interface ResponseInputItem {
   type: string
   role?: "developer" | "system" | "user" | "assistant"
   content?: string | Array<ResponseContent>
+  tools?: Array<ResponseTool>
   call_id?: string
   name?: string
+  namespace?: string
   arguments?: string
   output?: string | Array<ResponseContent>
 }
@@ -22,18 +24,41 @@ export interface ResponseContent {
 }
 
 export interface ResponseFunctionTool {
-  type: string
+  type: "function"
   name?: string
   description?: string
   parameters?: Record<string, unknown>
   strict?: boolean
 }
 
+export interface ResponseNamespaceTool {
+  type: "namespace"
+  name?: string
+  description?: string
+  tools?: Array<ResponseTool>
+}
+
+export type ResponseTool =
+  | ResponseFunctionTool
+  | ResponseNamespaceTool
+  | {
+      type:
+        | "code_interpreter"
+        | "computer_use_preview"
+        | "custom"
+        | "file_search"
+        | "image_generation"
+        | "local_shell"
+        | "mcp"
+        | "web_search"
+      [key: string]: unknown
+    }
+
 export interface ResponsesPayload {
   model: string
   input: string | Array<ResponseInputItem>
   stream?: boolean
-  tools?: Array<ResponseFunctionTool>
+  tools?: Array<ResponseTool>
   tool_choice?: "auto" | "none" | "required"
   parallel_tool_calls?: boolean
   reasoning?: {
@@ -91,6 +116,7 @@ export type ResponseOutputItem =
       status: "completed"
       call_id: string
       name: string
+      namespace?: string
       arguments: string
     }
 
@@ -123,10 +149,17 @@ export interface ResponsesStreamState {
       id: string
       callId: string
       name: string
+      responseName?: string
+      namespace?: string
       arguments: string
+      emittedArgumentLength: number
       added: boolean
     }
   >
+  toolNames?: {
+    fromCopilot: Map<string, { name: string; namespace?: string }>
+    toCopilot: Map<string, string>
+  }
   usage?: ChatCompletionChunk["usage"]
 }
 
