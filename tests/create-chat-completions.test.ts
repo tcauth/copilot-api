@@ -12,7 +12,10 @@ state.accountType = "individual"
 
 // Helper to mock fetch
 const fetchMock = mock(
-  (_url: string, opts: { headers: Record<string, string> }) => {
+  (
+    _url: string,
+    opts: { headers: Record<string, string>; signal?: AbortSignal },
+  ) => {
     return {
       ok: true,
       json: () => ({ id: "123", object: "chat.completion", choices: [] }),
@@ -53,4 +56,18 @@ test("sets X-Initiator to user if only user present", async () => {
     fetchMock.mock.calls[1][1] as { headers: Record<string, string> }
   ).headers
   expect(headers["X-Initiator"]).toBe("user")
+})
+
+test("forwards request cancellation to Copilot", async () => {
+  const controller = new AbortController()
+  await createChatCompletions(
+    {
+      messages: [{ role: "user", content: "hi" }],
+      model: "gpt-test",
+    },
+    controller.signal,
+  )
+
+  const options = fetchMock.mock.calls[2][1] as { signal?: AbortSignal }
+  expect(options.signal).toBe(controller.signal)
 })
