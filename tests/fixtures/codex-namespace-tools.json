@@ -1,0 +1,53 @@
+{
+  "model": "gpt-6.1-sol",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": "Delegate the check."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "Read one file",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "type": "namespace",
+      "name": "multi_agent_v1",
+      "description": "Coordinate local agents",
+      "tools": [
+        {
+          "type": "function",
+          "name": "spawn_agent",
+          "description": "Start one agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "prompt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "prompt"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  ],
+  "stream": true
+}
